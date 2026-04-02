@@ -19,9 +19,9 @@ int main(void)
     int *h_a, *h_b, *h_c;
     int *d_a, *d_b, *d_c;
 
-    h_a = (int*)malloc(size);
-    h_b = (int*)malloc(size);
-    h_c = (int*)malloc(size);
+    h_a = (int*)malloc(size);  // better to use : cudaMallocHost(&h_a,size); I should not overuse though, malloc is good.
+    h_b = (int*)malloc(size);  // better to use : cudaMallocHost(&h_b,size);
+    h_c = (int*)malloc(size);  // better to use : cudaMallocHost(&h_c,size);
 
     cudaMalloc(&d_a,size);
     cudaMalloc(&d_b,size);
