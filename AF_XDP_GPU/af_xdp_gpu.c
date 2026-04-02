@@ -214,8 +214,8 @@ static void update_stats_from_gpu_results(const struct gpu_batch_host *batch,
 
         if (result->is_ipv4[i] && result->src_ips[i] != 0) {
             update_source_counter(result->src_ips[i]);
-
-            /* For now trust the GPU's classification result directly */
+            
+            // GPU's decision
             if (result->malicious_flags[i])
                 g_stats.malicious_pkts++;
         }

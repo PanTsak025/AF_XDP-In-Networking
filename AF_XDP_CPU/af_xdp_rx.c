@@ -31,7 +31,7 @@
 #define FQ_RING_SIZE            2048
 #define CQ_RING_SIZE            2048
 
-/* AF_XDP receive burst size: how many descriptors we read per poll iteration */
+/* AF_XDP receive burst size: how many descriptors are read per poll iteration */
 #define RX_BURST_SIZE           64
 
 /*                         CHANGE THISSSSSSSSSSSSSS */

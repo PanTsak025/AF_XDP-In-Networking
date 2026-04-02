@@ -1,7 +1,7 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <stdio.h>
-
+ // THIS CODE IS FOR UNDERSTANDING SIMPLE DDOS, NEEDS LOGIC REFINING
 #include "gpu_kernels.h"
 
 static uint8_t  *d_packet_buffer = NULL;
