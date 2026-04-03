@@ -13,7 +13,7 @@
 
 #define NUM_SLOTS 2
 #define NUM_BATCHES 8
-#define BATCH_SIZE 4096
+#define BATCH_SIZE 65536
 #define THREADS_PER_BLOCK 256
 
 typedef struct {
