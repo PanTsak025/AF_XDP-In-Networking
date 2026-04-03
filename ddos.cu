@@ -3,6 +3,13 @@
 #include <stdint.h>
 #include <cuda_runtime.h>
 
+/*
+    Networking apps can benefit from GPU only if:
+        Batches are large enough
+        memory is SoA
+        transfers are pinned (cudaMallocHost)+ async(cudaMemcpyAsync)
+        Use of double buffering + streams 
+*/
 
 __global__ void classify_kernel(const int16_t *dst_port,const int8_t *protocol,const int16_t *pkt_length, int *flags, int n)
 {
