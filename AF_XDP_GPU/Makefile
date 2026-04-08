@@ -38,4 +38,4 @@ clean:
 run: all
 	sudo ./$(TARGET) $(IFACE) $(QUEUE)
 
-.PHONY: all clean run
+.PHONY: all clean runs

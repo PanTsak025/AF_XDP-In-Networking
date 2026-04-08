@@ -15,17 +15,16 @@ static uint64_t            *d_epoch_secs      = NULL;
 static uint8_t             *d_malicious_flags = NULL;
 static struct gpu_pkt_meta *d_meta            = NULL;
 
-/* Persistent per-IP state, intentionally same size class as CPU baseline */
-static uint32_t *d_ip_keys        = NULL;
-static uint64_t *d_total_counts   = NULL;   /* not required for classification, but mirrors CPU state */
-static uint64_t *d_window_counts  = NULL;
-static uint64_t *d_last_window    = NULL;
-static uint8_t  *d_malicious_ip   = NULL;
-static uint32_t *d_entry_locks    = NULL;
+/* Persistent per-IP state */
+static uint32_t *d_ip_keys          = NULL;
+static uint64_t *d_total_counts     = NULL;
+static uint64_t *d_window_counts    = NULL;
+static uint64_t *d_last_window      = NULL;
+static uint32_t *d_malicious_ip     = NULL;   /* changed from uint8_t* to uint32_t* */
 
-static uint32_t g_max_batch_size  = 0;
-static uint32_t g_max_total_bytes = 0;
-static uint32_t g_threshold       = DEFAULT_THRESHOLD;
+static uint32_t g_max_batch_size    = 0;
+static uint32_t g_max_total_bytes   = 0;
+static uint32_t g_threshold         = DEFAULT_THRESHOLD;
 
 static int check_cuda(cudaError_t err, const char *where)
 {
@@ -42,10 +41,7 @@ __device__ static inline uint16_t load_be16(const uint8_t *p)
 }
 
 /*
- * Match CPU ip->saddr in-memory byte layout on little-endian systems.
- * For packet bytes [a,b,c,d], this returns a | b<<8 | c<<16 | d<<24.
- *
- * That makes inet_ntop(AF_INET, &src_ip, ...) behave like the CPU baseline.
+ * Match CPU ip->saddr in-memory layout on little-endian systems.
  */
 __device__ static inline uint32_t load_u32_cpu_layout(const uint8_t *p)
 {
@@ -66,23 +62,29 @@ __device__ static inline uint32_t hash_ip(uint32_t ip)
     return x;
 }
 
-__device__ static inline void lock_entry(uint32_t *lock_word)
+__device__ static inline uint64_t atomic_exchange_u64(uint64_t *addr, uint64_t val)
 {
-    while (atomicCAS(lock_word, 0U, 1U) != 0U) {
-        /* spin */
-    }
+    unsigned long long *ptr = (unsigned long long *)addr;
+    unsigned long long old = *ptr;
+    unsigned long long assumed;
+
+    do {
+        assumed = old;
+        old = atomicCAS(ptr, assumed, (unsigned long long)val);
+    } while (old != assumed);
+
+    return (uint64_t)old;
 }
 
-__device__ static inline void unlock_entry(uint32_t *lock_word)
+__device__ static inline uint64_t atomic_add_u64(uint64_t *addr, uint64_t val)
 {
-    atomicExch(lock_word, 0U);
+    return (uint64_t)atomicAdd((unsigned long long *)addr, (unsigned long long)val);
 }
 
 /*
- * CPU-equivalent lookup/insert:
- * - linear probing
- * - fixed table size 65536
- * - if full and IP not already present, return failure
+ * Find existing or insert new slot.
+ * Same basic semantics as CPU linear probing.
+ * If table is full for a new IP, return failure and classify as non-malicious.
  */
 __device__ static inline uint32_t find_or_insert_slot(uint32_t *keys, uint32_t src_ip)
 {
@@ -100,34 +102,14 @@ __device__ static inline uint32_t find_or_insert_slot(uint32_t *keys, uint32_t s
 }
 
 /*
- * Closest equivalent to:
- *
- *   entry = get_ip_counter(src_ip);
- *   if (!entry) return;
- *   now = time(NULL);
- *   if (entry->last_window != now) {
- *       entry->window_count = 0;
- *       entry->last_window = now;
- *       entry->malicious = 0;
- *   }
- *   entry->window_count++;
- *   entry->total_count++;
- *   if (entry->window_count > DDOS_PPS_THRESHOLD)
- *       entry->malicious = 1;
- *
- * Returns:
- *   0 -> packet not malicious
- *   1 -> packet malicious
- *
- * If slot allocation fails for a new IP because the table is full,
- * behave like CPU baseline: do nothing and return not malicious.
+ * Non-blocking update path.
+ * Safer under single-IP floods than spin locks.
  */
 __device__ static inline uint8_t update_source_counter_gpu(uint32_t *keys,
                                                            uint64_t *total_counts,
                                                            uint64_t *window_counts,
                                                            uint64_t *last_window,
-                                                           uint8_t *malicious_ip,
-                                                           uint32_t *entry_locks,
+                                                           uint32_t *malicious_ip,
                                                            uint32_t src_ip,
                                                            uint64_t now_sec,
                                                            uint32_t threshold)
@@ -136,24 +118,22 @@ __device__ static inline uint8_t update_source_counter_gpu(uint32_t *keys,
     if (slot == 0xFFFFFFFFu)
         return 0;
 
-    lock_entry(&entry_locks[slot]);
+    uint64_t prev_window = atomic_exchange_u64(&last_window[slot], now_sec);
 
-    if (last_window[slot] != now_sec) {
-        window_counts[slot] = 0;
-        last_window[slot] = now_sec;
-        malicious_ip[slot] = 0;
+    if (prev_window != now_sec) {
+        atomic_exchange_u64(&window_counts[slot], 0ULL);
+        atomicExch(&malicious_ip[slot], 0U);
     }
 
-    window_counts[slot]++;
-    total_counts[slot]++;
+    uint64_t new_window = atomic_add_u64(&window_counts[slot], 1ULL) + 1ULL;
+    atomic_add_u64(&total_counts[slot], 1ULL);
 
-    if (window_counts[slot] > (uint64_t)threshold)
-        malicious_ip[slot] = 1;
+    if (new_window > (uint64_t)threshold) {
+        atomicExch(&malicious_ip[slot], 1U);
+        return 1;
+    }
 
-    uint8_t result = malicious_ip[slot];
-
-    unlock_entry(&entry_locks[slot]);
-    return result;
+    return malicious_ip[slot] ? 1 : 0;
 }
 
 __global__ void classify_packets_kernel(const uint8_t *packet_buffer,
@@ -167,8 +147,7 @@ __global__ void classify_packets_kernel(const uint8_t *packet_buffer,
                                         uint64_t *total_counts,
                                         uint64_t *window_counts,
                                         uint64_t *last_window,
-                                        uint8_t *malicious_ip,
-                                        uint32_t *entry_locks,
+                                        uint32_t *malicious_ip,
                                         uint32_t threshold)
 {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -195,7 +174,6 @@ __global__ void classify_packets_kernel(const uint8_t *packet_buffer,
         return;
     }
 
-    /* ethhdr bounds check equivalent */
     if (data + 14 > data_end) {
         meta[i].malformed = 1;
         return;
@@ -203,22 +181,17 @@ __global__ void classify_packets_kernel(const uint8_t *packet_buffer,
 
     meta[i].eth_counted = 1;
 
-    /* Ethernet type at bytes 12-13 */
     uint16_t eth_proto = load_be16(pkt + 12);
     if (eth_proto != 0x0800) {
-        /* CPU returns 0 here: valid Ethernet but not IPv4 */
         return;
     }
 
-    /* Need at least minimal IPv4 header */
     if (len < 14 + 20) {
         meta[i].malformed = 1;
         return;
     }
 
     const uint8_t *ip = pkt + 14;
-
-    /* Equivalent to ip pointer bounds and ihl checks */
     uint8_t version = ip[0] >> 4;
     uint8_t ihl = ip[0] & 0x0F;
     uint32_t ip_hdr_len = (uint32_t)ihl * 4;
@@ -243,14 +216,14 @@ __global__ void classify_packets_kernel(const uint8_t *packet_buffer,
     meta[i].pkt_len = (uint16_t)len;
     meta[i].l4_proto = ip[9];
 
-    if (meta[i].l4_proto == 6) { /* TCP */
+    if (meta[i].l4_proto == 6) {
         const uint8_t *tcp = ip + ip_hdr_len;
         if (tcp + 20 > data_end) {
             meta[i].malformed = 1;
             return;
         }
         meta[i].valid = 1;
-    } else if (meta[i].l4_proto == 17) { /* UDP */
+    } else if (meta[i].l4_proto == 17) {
         const uint8_t *udp = ip + ip_hdr_len;
         if (udp + 8 > data_end) {
             meta[i].malformed = 1;
@@ -258,7 +231,6 @@ __global__ void classify_packets_kernel(const uint8_t *packet_buffer,
         }
         meta[i].valid = 1;
     } else {
-        /* Other L4 protocol: CPU counts other_l4 and returns valid */
         meta[i].valid = 1;
     }
 
@@ -268,7 +240,6 @@ __global__ void classify_packets_kernel(const uint8_t *packet_buffer,
                                                        window_counts,
                                                        last_window,
                                                        malicious_ip,
-                                                       entry_locks,
                                                        meta[i].src_ip,
                                                        epoch_secs[i],
                                                        threshold);
@@ -321,12 +292,8 @@ extern "C" int gpu_init(uint32_t max_batch_size, uint32_t max_total_bytes)
                    "cudaMalloc d_last_window") != 0)
         return -1;
 
-    if (check_cuda(cudaMalloc((void **)&d_malicious_ip, GPU_MAX_IP_ENTRIES * sizeof(uint8_t)),
+    if (check_cuda(cudaMalloc((void **)&d_malicious_ip, GPU_MAX_IP_ENTRIES * sizeof(uint32_t)),
                    "cudaMalloc d_malicious_ip") != 0)
-        return -1;
-
-    if (check_cuda(cudaMalloc((void **)&d_entry_locks, GPU_MAX_IP_ENTRIES * sizeof(uint32_t)),
-                   "cudaMalloc d_entry_locks") != 0)
         return -1;
 
     return gpu_reset_state();
@@ -335,7 +302,7 @@ extern "C" int gpu_init(uint32_t max_batch_size, uint32_t max_total_bytes)
 extern "C" int gpu_reset_state(void)
 {
     if (!d_ip_keys || !d_total_counts || !d_window_counts ||
-        !d_last_window || !d_malicious_ip || !d_entry_locks)
+        !d_last_window || !d_malicious_ip)
         return -1;
 
     if (check_cuda(cudaMemset(d_ip_keys, 0xFF, GPU_MAX_IP_ENTRIES * sizeof(uint32_t)),
@@ -354,12 +321,8 @@ extern "C" int gpu_reset_state(void)
                    "cudaMemset d_last_window") != 0)
         return -1;
 
-    if (check_cuda(cudaMemset(d_malicious_ip, 0, GPU_MAX_IP_ENTRIES * sizeof(uint8_t)),
+    if (check_cuda(cudaMemset(d_malicious_ip, 0, GPU_MAX_IP_ENTRIES * sizeof(uint32_t)),
                    "cudaMemset d_malicious_ip") != 0)
-        return -1;
-
-    if (check_cuda(cudaMemset(d_entry_locks, 0, GPU_MAX_IP_ENTRIES * sizeof(uint32_t)),
-                   "cudaMemset d_entry_locks") != 0)
         return -1;
 
     return 0;
@@ -421,7 +384,6 @@ extern "C" int gpu_classify_batch(const uint8_t *packet_buffer,
                                                  d_window_counts,
                                                  d_last_window,
                                                  d_malicious_ip,
-                                                 d_entry_locks,
                                                  g_threshold);
 
     if (check_cuda(cudaGetLastError(), "kernel launch") != 0)
@@ -459,7 +421,6 @@ extern "C" void gpu_cleanup(void)
     if (d_window_counts)   cudaFree(d_window_counts);
     if (d_last_window)     cudaFree(d_last_window);
     if (d_malicious_ip)    cudaFree(d_malicious_ip);
-    if (d_entry_locks)     cudaFree(d_entry_locks);
 
     d_packet_buffer   = NULL;
     d_offsets         = NULL;
@@ -473,7 +434,6 @@ extern "C" void gpu_cleanup(void)
     d_window_counts   = NULL;
     d_last_window     = NULL;
     d_malicious_ip    = NULL;
-    d_entry_locks     = NULL;
 
     g_max_batch_size  = 0;
     g_max_total_bytes = 0;

@@ -73,6 +73,8 @@ struct stats {
     uint64_t malformed_pkts;
     uint64_t malicious_pkts;
     uint64_t dropped_fill_reserve;
+    uint64_t dropped_batch_oversize;
+    uint64_t gpu_submit_fail;
 };
 
 struct gpu_batch_host {
@@ -117,10 +119,6 @@ static void reset_gpu_batch(struct gpu_batch_host *batch)
 
 static void fill_batch_epoch_secs(struct gpu_batch_host *batch)
 {
-    /*
-     * CPU baseline calls time(NULL) once per packet inside classify_batch_cpu().
-     * Do the same here before GPU submission.
-     */
     for (uint32_t i = 0; i < batch->count; i++)
         batch->epoch_secs[i] = (uint64_t)time(NULL);
 }
@@ -159,17 +157,25 @@ static void update_stats_from_gpu_results(const struct gpu_batch_host *batch,
 
 static int recycle_batch_addrs(struct xsk_state *xsks, uint64_t *addrs, uint32_t count)
 {
-    uint32_t idx_fq = 0;
-    int reserved = xsk_ring_prod__reserve(&xsks->fq, count, &idx_fq);
-    if (reserved != (int)count) {
-        g_stats.dropped_fill_reserve++;
-        return -1;
+    uint32_t done = 0;
+
+    while (done < count) {
+        uint32_t idx_fq = 0;
+        uint32_t remaining = count - done;
+        int reserved = xsk_ring_prod__reserve(&xsks->fq, remaining, &idx_fq);
+
+        if (reserved <= 0) {
+            g_stats.dropped_fill_reserve += (count - done);
+            return -1;
+        }
+
+        for (int i = 0; i < reserved; i++)
+            *xsk_ring_prod__fill_addr(&xsks->fq, idx_fq + (uint32_t)i) = addrs[done + (uint32_t)i];
+
+        xsk_ring_prod__submit(&xsks->fq, (uint32_t)reserved);
+        done += (uint32_t)reserved;
     }
 
-    for (uint32_t i = 0; i < count; i++)
-        *xsk_ring_prod__fill_addr(&xsks->fq, idx_fq + i) = addrs[i];
-
-    xsk_ring_prod__submit(&xsks->fq, count);
     return 0;
 }
 
@@ -191,6 +197,7 @@ static int flush_gpu_batch(struct xsk_state *xsks,
                            batch->total_bytes,
                            result->malicious_flags,
                            result->meta) != 0) {
+        g_stats.gpu_submit_fail++;
         return -1;
     }
 
@@ -354,22 +361,24 @@ static void print_periodic_stats(time_t start_ts)
     double bps = ((double)g_stats.total_bytes * 8.0) / elapsed;
 
     printf("\n=== AF_XDP GPU-batched stats ===\n");
-    printf("elapsed_sec       : %.0f\n", elapsed);
-    printf("total_pkts        : %llu\n", (unsigned long long)g_stats.total_pkts);
-    printf("total_bytes       : %llu\n", (unsigned long long)g_stats.total_bytes);
-    printf("pps               : %.2f\n", pps);
-    printf("bps               : %.2f\n", bps);
-    printf("eth_pkts          : %llu\n", (unsigned long long)g_stats.eth_pkts);
-    printf("ipv4_pkts         : %llu\n", (unsigned long long)g_stats.ipv4_pkts);
-    printf("tcp_pkts          : %llu\n", (unsigned long long)g_stats.tcp_pkts);
-    printf("udp_pkts          : %llu\n", (unsigned long long)g_stats.udp_pkts);
-    printf("other_l4_pkts     : %llu\n", (unsigned long long)g_stats.other_l4_pkts);
-    printf("malformed_pkts    : %llu\n", (unsigned long long)g_stats.malformed_pkts);
-    printf("malicious_pkts    : %llu\n", (unsigned long long)g_stats.malicious_pkts);
-    printf("fill_reserve_fail : %llu\n", (unsigned long long)g_stats.dropped_fill_reserve);
-    printf("rx_burst_size     : %d\n", RX_BURST_SIZE);
-    printf("classify_batch    : %d\n", CLASSIFY_BATCH_SIZE);
-    printf("threshold_pps     : %d\n", DDOS_PPS_THRESHOLD);
+    printf("elapsed_sec           : %.0f\n", elapsed);
+    printf("total_pkts            : %llu\n", (unsigned long long)g_stats.total_pkts);
+    printf("total_bytes           : %llu\n", (unsigned long long)g_stats.total_bytes);
+    printf("pps                   : %.2f\n", pps);
+    printf("bps                   : %.2f\n", bps);
+    printf("eth_pkts              : %llu\n", (unsigned long long)g_stats.eth_pkts);
+    printf("ipv4_pkts             : %llu\n", (unsigned long long)g_stats.ipv4_pkts);
+    printf("tcp_pkts              : %llu\n", (unsigned long long)g_stats.tcp_pkts);
+    printf("udp_pkts              : %llu\n", (unsigned long long)g_stats.udp_pkts);
+    printf("other_l4_pkts         : %llu\n", (unsigned long long)g_stats.other_l4_pkts);
+    printf("malformed_pkts        : %llu\n", (unsigned long long)g_stats.malformed_pkts);
+    printf("malicious_pkts        : %llu\n", (unsigned long long)g_stats.malicious_pkts);
+    printf("fill_reserve_fail     : %llu\n", (unsigned long long)g_stats.dropped_fill_reserve);
+    printf("dropped_batch_oversize: %llu\n", (unsigned long long)g_stats.dropped_batch_oversize);
+    printf("gpu_submit_fail       : %llu\n", (unsigned long long)g_stats.gpu_submit_fail);
+    printf("rx_burst_size         : %d\n", RX_BURST_SIZE);
+    printf("classify_batch        : %d\n", CLASSIFY_BATCH_SIZE);
+    printf("threshold_pps         : %d\n", DDOS_PPS_THRESHOLD);
 
     if (total_classified_pkts > 0) {
         double avg_proc_latency_ns =
@@ -377,9 +386,9 @@ static void print_periodic_stats(time_t start_ts)
         double avg_proc_latency_us = avg_proc_latency_ns / 1000.0;
         double avg_proc_latency_ms = avg_proc_latency_ns / 1000000.0;
 
-        printf("avg_proc_latency_ns : %.2f\n", avg_proc_latency_ns);
-        printf("avg_proc_latency_us : %.3f\n", avg_proc_latency_us);
-        printf("avg_proc_latency_ms : %.6f\n", avg_proc_latency_ms);
+        printf("avg_proc_latency_ns   : %.2f\n", avg_proc_latency_ns);
+        printf("avg_proc_latency_us   : %.3f\n", avg_proc_latency_us);
+        printf("avg_proc_latency_ms   : %.6f\n", avg_proc_latency_ms);
     }
 }
 
@@ -427,13 +436,12 @@ static void rx_loop(struct xsk_state *xsks)
                     batch_timer_active = 1;
                 }
 
-                /*
-                 * AF_XDP frame len should already fit FRAME_SIZE, but keep a guard
-                 * so we never overflow the host batch buffer.
-                 */
                 if (len > MAX_PKT_SIZE) {
-                    uint64_t tmp = desc->addr;
-                    (void)recycle_batch_addrs(xsks, &tmp, 1);
+                    g_stats.dropped_batch_oversize++;
+                    {
+                        uint64_t tmp = desc->addr;
+                        (void)recycle_batch_addrs(xsks, &tmp, 1);
+                    }
                     continue;
                 }
 
@@ -474,6 +482,28 @@ static void rx_loop(struct xsk_state *xsks)
                         return;
                     }
 
+                    {
+                        uint64_t batch_end_ns = get_time_ns();
+                        total_classification_time_ns += (batch_end_ns - batch_start_ns);
+                        total_classified_pkts += flushed_pkts;
+                        batch_timer_active = 0;
+                    }
+                }
+            }
+
+            xsk_ring_cons__release(&xsks->rx, rcvd);
+        }
+
+        {
+            time_t now = time(NULL);
+
+            if (batch.count > 0 && (now - last_print >= 1)) {
+                unsigned int flushed_pkts = batch.count;
+
+                if (flush_gpu_batch(xsks, &batch, &result, recycle_addrs) < 0)
+                    break;
+
+                {
                     uint64_t batch_end_ns = get_time_ns();
                     total_classification_time_ns += (batch_end_ns - batch_start_ns);
                     total_classified_pkts += flushed_pkts;
@@ -481,38 +511,24 @@ static void rx_loop(struct xsk_state *xsks)
                 }
             }
 
-            xsk_ring_cons__release(&xsks->rx, rcvd);
+            if (now - last_print >= 1) {
+                print_periodic_stats(start_ts);
+                last_print = now;
+            }
         }
+    }
 
-        time_t now = time(NULL);
+    if (running && batch.count > 0) {
+        unsigned int flushed_pkts = batch.count;
 
-        if (batch.count > 0 && (now - last_print >= 1)) {
-            unsigned int flushed_pkts = batch.count;
+        (void)flush_gpu_batch(xsks, &batch, &result, recycle_addrs);
 
-            if (flush_gpu_batch(xsks, &batch, &result, recycle_addrs) < 0)
-                break;
-
+        {
             uint64_t batch_end_ns = get_time_ns();
             total_classification_time_ns += (batch_end_ns - batch_start_ns);
             total_classified_pkts += flushed_pkts;
             batch_timer_active = 0;
         }
-
-        if (now - last_print >= 1) {
-            print_periodic_stats(start_ts);
-            last_print = now;
-        }
-    }
-
-    if (batch.count > 0) {
-        unsigned int flushed_pkts = batch.count;
-
-        (void)flush_gpu_batch(xsks, &batch, &result, recycle_addrs);
-
-        uint64_t batch_end_ns = get_time_ns();
-        total_classification_time_ns += (batch_end_ns - batch_start_ns);
-        total_classified_pkts += flushed_pkts;
-        batch_timer_active = 0;
     }
 
     print_periodic_stats(start_ts);

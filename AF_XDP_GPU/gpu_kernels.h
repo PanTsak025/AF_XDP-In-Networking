@@ -7,7 +7,6 @@
 extern "C" {
 #endif
 
-
 struct gpu_pkt_meta {
     uint32_t src_ip;
     uint16_t pkt_len;
@@ -22,7 +21,6 @@ struct gpu_pkt_meta {
 int gpu_init(uint32_t max_batch_size, uint32_t max_total_bytes);
 int gpu_reset_state(void);
 int gpu_set_threshold(uint32_t threshold);
-
 
 int gpu_classify_batch(const uint8_t *packet_buffer,
                        const uint32_t *offsets,
