@@ -2,10 +2,10 @@ BPF_CLANG ?= clang
 BPF_CFLAGS := -O2 -g -target bpf
 
 CC ?= gcc
-CFLAGS := -O2 -g -Wall -Wextra
+CFLAGS := -O2 -g -Wall -Wextra -I.
 
 NVCC ?= nvcc
-NVCCFLAGS := -O2 -Xcompiler -fPIC
+NVCCFLAGS := -O2 -Xcompiler -fPIC -I.
 
 CUDA_HOME ?= /usr/local/cuda
 CUDA_INC := -I$(CUDA_HOME)/include

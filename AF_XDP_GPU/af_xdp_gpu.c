@@ -36,7 +36,6 @@
 #define RX_BURST_SIZE           64
 #define CLASSIFY_BATCH_SIZE     1024
 
-#define MAX_IP_ENTRIES          65536
 #define DDOS_PPS_THRESHOLD      2000
 
 #define MAX_BATCH_PKTS          CLASSIFY_BATCH_SIZE
@@ -74,38 +73,23 @@ struct stats {
     uint64_t malformed_pkts;
     uint64_t malicious_pkts;
     uint64_t dropped_fill_reserve;
-    uint64_t dropped_batch_oversize;
-    uint64_t gpu_submit_fail;
-};
-
-struct ip_counter {
-    uint32_t src_ip;
-    uint64_t total_count;
-    uint64_t window_count;
-    time_t last_window;
-    uint8_t used;
-    uint8_t malicious;
 };
 
 struct gpu_batch_host {
     uint8_t  packet_buffer[MAX_BATCH_BYTES];
     uint32_t offsets[MAX_BATCH_PKTS];
     uint32_t lengths[MAX_BATCH_PKTS];
+    uint64_t epoch_secs[MAX_BATCH_PKTS];
     uint32_t count;
     uint32_t total_bytes;
 };
 
 struct gpu_result_host {
-    uint8_t  malicious_flags[MAX_BATCH_PKTS];
-    uint32_t src_ips[MAX_BATCH_PKTS];
-    uint8_t  valid_flags[MAX_BATCH_PKTS];
-    uint8_t  is_ipv4[MAX_BATCH_PKTS];
-    uint8_t  l4_proto[MAX_BATCH_PKTS];
-    uint8_t  malformed_flags[MAX_BATCH_PKTS];
+    uint8_t malicious_flags[MAX_BATCH_PKTS];
+    struct gpu_pkt_meta meta[MAX_BATCH_PKTS];
 };
 
 static struct stats g_stats = {0};
-static struct ip_counter g_ip_table[MAX_IP_ENTRIES];
 
 static void on_sigint(int signo)
 {
@@ -125,100 +109,51 @@ static inline uint8_t *xsk_umem_get_data(void *umem_area, uint64_t addr)
     return (uint8_t *)umem_area + addr;
 }
 
-static uint32_t hash_ip(uint32_t ip)
-{
-    uint32_t x = ip;
-    x ^= x >> 16;
-    x *= 0x7feb352d;
-    x ^= x >> 15;
-    x *= 0x846ca68b;
-    x ^= x >> 16;
-    return x;
-}
-
-static struct ip_counter *get_ip_counter(uint32_t src_ip)
-{
-    uint32_t idx = hash_ip(src_ip) % MAX_IP_ENTRIES;
-
-    for (uint32_t i = 0; i < MAX_IP_ENTRIES; i++) {
-        struct ip_counter *entry = &g_ip_table[(idx + i) % MAX_IP_ENTRIES];
-
-        if (!entry->used) {
-            entry->used = 1;
-            entry->src_ip = src_ip;
-            entry->total_count = 0;
-            entry->window_count = 0;
-            entry->last_window = 0;
-            entry->malicious = 0;
-            return entry;
-        }
-
-        if (entry->src_ip == src_ip)
-            return entry;
-    }
-
-    return NULL;
-}
-
-static void update_source_counter(uint32_t src_ip)
-{
-    struct ip_counter *entry = get_ip_counter(src_ip);
-    if (!entry)
-        return;
-
-    time_t now = time(NULL);
-
-    if (entry->last_window != now) {
-        entry->window_count = 0;
-        entry->last_window = now;
-        entry->malicious = 0;
-    }
-
-    entry->window_count++;
-    entry->total_count++;
-
-    if (entry->window_count > DDOS_PPS_THRESHOLD)
-        entry->malicious = 1;
-}
-
 static void reset_gpu_batch(struct gpu_batch_host *batch)
 {
     batch->count = 0;
     batch->total_bytes = 0;
 }
 
+static void fill_batch_epoch_secs(struct gpu_batch_host *batch)
+{
+    /*
+     * CPU baseline calls time(NULL) once per packet inside classify_batch_cpu().
+     * Do the same here before GPU submission.
+     */
+    for (uint32_t i = 0; i < batch->count; i++)
+        batch->epoch_secs[i] = (uint64_t)time(NULL);
+}
+
 static void update_stats_from_gpu_results(const struct gpu_batch_host *batch,
                                           const struct gpu_result_host *result)
 {
     for (uint32_t i = 0; i < batch->count; i++) {
+        const struct gpu_pkt_meta *m = &result->meta[i];
+
         g_stats.total_pkts++;
         g_stats.total_bytes += batch->lengths[i];
 
-        if (result->malformed_flags[i]) {
-            g_stats.malformed_pkts++;
-            continue;
-        }
-
-        if (result->valid_flags[i])
+        if (m->eth_counted)
             g_stats.eth_pkts++;
 
-        if (result->is_ipv4[i])
+        if (m->ipv4_counted)
             g_stats.ipv4_pkts++;
 
-        if (result->l4_proto[i] == IPPROTO_TCP)
-            g_stats.tcp_pkts++;
-        else if (result->l4_proto[i] == IPPROTO_UDP)
-            g_stats.udp_pkts++;
-        else if (result->is_ipv4[i])
-            g_stats.other_l4_pkts++;
+        if (m->malformed)
+            g_stats.malformed_pkts++;
 
-        if (result->is_ipv4[i] && result->src_ips[i] != 0) {
-            update_source_counter(result->src_ips[i]);
-            
-            // GPU's decision
-            if (result->malicious_flags[i])
-                g_stats.malicious_pkts++;
+        if (m->valid) {
+            if (m->l4_proto == IPPROTO_TCP)
+                g_stats.tcp_pkts++;
+            else if (m->l4_proto == IPPROTO_UDP)
+                g_stats.udp_pkts++;
+            else
+                g_stats.other_l4_pkts++;
         }
+
+        if (result->malicious_flags[i])
+            g_stats.malicious_pkts++;
     }
 }
 
@@ -246,18 +181,16 @@ static int flush_gpu_batch(struct xsk_state *xsks,
     if (batch->count == 0)
         return 0;
 
+    fill_batch_epoch_secs(batch);
+
     if (gpu_classify_batch(batch->packet_buffer,
                            batch->offsets,
                            batch->lengths,
+                           batch->epoch_secs,
                            batch->count,
                            batch->total_bytes,
                            result->malicious_flags,
-                           result->src_ips,
-                           result->valid_flags,
-                           result->is_ipv4,
-                           result->l4_proto,
-                           result->malformed_flags) != 0) {
-        g_stats.gpu_submit_fail++;
+                           result->meta) != 0) {
         return -1;
     }
 
@@ -421,24 +354,22 @@ static void print_periodic_stats(time_t start_ts)
     double bps = ((double)g_stats.total_bytes * 8.0) / elapsed;
 
     printf("\n=== AF_XDP GPU-batched stats ===\n");
-    printf("elapsed_sec           : %.0f\n", elapsed);
-    printf("total_pkts            : %llu\n", (unsigned long long)g_stats.total_pkts);
-    printf("total_bytes           : %llu\n", (unsigned long long)g_stats.total_bytes);
-    printf("pps                   : %.2f\n", pps);
-    printf("bps                   : %.2f\n", bps);
-    printf("eth_pkts              : %llu\n", (unsigned long long)g_stats.eth_pkts);
-    printf("ipv4_pkts             : %llu\n", (unsigned long long)g_stats.ipv4_pkts);
-    printf("tcp_pkts              : %llu\n", (unsigned long long)g_stats.tcp_pkts);
-    printf("udp_pkts              : %llu\n", (unsigned long long)g_stats.udp_pkts);
-    printf("other_l4_pkts         : %llu\n", (unsigned long long)g_stats.other_l4_pkts);
-    printf("malformed_pkts        : %llu\n", (unsigned long long)g_stats.malformed_pkts);
-    printf("malicious_pkts        : %llu\n", (unsigned long long)g_stats.malicious_pkts);
-    printf("fill_reserve_fail     : %llu\n", (unsigned long long)g_stats.dropped_fill_reserve);
-    printf("dropped_batch_oversize: %llu\n", (unsigned long long)g_stats.dropped_batch_oversize);
-    printf("gpu_submit_fail       : %llu\n", (unsigned long long)g_stats.gpu_submit_fail);
-    printf("rx_burst_size         : %d\n", RX_BURST_SIZE);
-    printf("classify_batch        : %d\n", CLASSIFY_BATCH_SIZE);
-    printf("threshold_pps         : %d\n", DDOS_PPS_THRESHOLD);
+    printf("elapsed_sec       : %.0f\n", elapsed);
+    printf("total_pkts        : %llu\n", (unsigned long long)g_stats.total_pkts);
+    printf("total_bytes       : %llu\n", (unsigned long long)g_stats.total_bytes);
+    printf("pps               : %.2f\n", pps);
+    printf("bps               : %.2f\n", bps);
+    printf("eth_pkts          : %llu\n", (unsigned long long)g_stats.eth_pkts);
+    printf("ipv4_pkts         : %llu\n", (unsigned long long)g_stats.ipv4_pkts);
+    printf("tcp_pkts          : %llu\n", (unsigned long long)g_stats.tcp_pkts);
+    printf("udp_pkts          : %llu\n", (unsigned long long)g_stats.udp_pkts);
+    printf("other_l4_pkts     : %llu\n", (unsigned long long)g_stats.other_l4_pkts);
+    printf("malformed_pkts    : %llu\n", (unsigned long long)g_stats.malformed_pkts);
+    printf("malicious_pkts    : %llu\n", (unsigned long long)g_stats.malicious_pkts);
+    printf("fill_reserve_fail : %llu\n", (unsigned long long)g_stats.dropped_fill_reserve);
+    printf("rx_burst_size     : %d\n", RX_BURST_SIZE);
+    printf("classify_batch    : %d\n", CLASSIFY_BATCH_SIZE);
+    printf("threshold_pps     : %d\n", DDOS_PPS_THRESHOLD);
 
     if (total_classified_pkts > 0) {
         double avg_proc_latency_ns =
@@ -446,42 +377,9 @@ static void print_periodic_stats(time_t start_ts)
         double avg_proc_latency_us = avg_proc_latency_ns / 1000.0;
         double avg_proc_latency_ms = avg_proc_latency_ns / 1000000.0;
 
-        printf("avg_proc_latency_ns   : %.2f\n", avg_proc_latency_ns);
-        printf("avg_proc_latency_us   : %.3f\n", avg_proc_latency_us);
-        printf("avg_proc_latency_ms   : %.6f\n", avg_proc_latency_ms);
-    }
-}
-
-static void print_top_suspects(void)
-{
-    printf("top malicious/active sources:\n");
-
-    for (int round = 0; round < 10; round++) {
-        uint64_t best_count = 0;
-        int best_idx = -1;
-
-        for (int i = 0; i < MAX_IP_ENTRIES; i++) {
-            if (!g_ip_table[i].used)
-                continue;
-            if (g_ip_table[i].total_count > best_count) {
-                best_count = g_ip_table[i].total_count;
-                best_idx = i;
-            }
-        }
-
-        if (best_idx < 0 || best_count == 0)
-            break;
-
-        char ipbuf[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &g_ip_table[best_idx].src_ip, ipbuf, sizeof(ipbuf));
-
-        printf("  src=%s total=%llu window=%llu malicious=%u\n",
-               ipbuf,
-               (unsigned long long)g_ip_table[best_idx].total_count,
-               (unsigned long long)g_ip_table[best_idx].window_count,
-               g_ip_table[best_idx].malicious);
-
-        g_ip_table[best_idx].total_count = 0;
+        printf("avg_proc_latency_ns : %.2f\n", avg_proc_latency_ns);
+        printf("avg_proc_latency_us : %.3f\n", avg_proc_latency_us);
+        printf("avg_proc_latency_ms : %.6f\n", avg_proc_latency_ms);
     }
 }
 
@@ -529,9 +427,11 @@ static void rx_loop(struct xsk_state *xsks)
                     batch_timer_active = 1;
                 }
 
+                /*
+                 * AF_XDP frame len should already fit FRAME_SIZE, but keep a guard
+                 * so we never overflow the host batch buffer.
+                 */
                 if (len > MAX_PKT_SIZE) {
-                    g_stats.dropped_batch_oversize++;
-                    /* still recycle */
                     uint64_t tmp = desc->addr;
                     (void)recycle_batch_addrs(xsks, &tmp, 1);
                     continue;
@@ -616,7 +516,6 @@ static void rx_loop(struct xsk_state *xsks)
     }
 
     print_periodic_stats(start_ts);
-    print_top_suspects();
 }
 
 static void cleanup(struct xsk_state *xsks, struct bpf_object *obj, const char *ifname)
@@ -677,6 +576,18 @@ int main(int argc, char **argv)
 
     if (gpu_init(CLASSIFY_BATCH_SIZE, MAX_BATCH_BYTES) != 0) {
         fprintf(stderr, "failed to initialize GPU backend\n");
+        cleanup(&xsks, obj, ifname);
+        return 1;
+    }
+
+    if (gpu_reset_state() != 0) {
+        fprintf(stderr, "failed to reset GPU backend\n");
+        cleanup(&xsks, obj, ifname);
+        return 1;
+    }
+
+    if (gpu_set_threshold(DDOS_PPS_THRESHOLD) != 0) {
+        fprintf(stderr, "failed to set GPU threshold\n");
         cleanup(&xsks, obj, ifname);
         return 1;
     }
