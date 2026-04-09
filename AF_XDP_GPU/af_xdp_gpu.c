@@ -34,7 +34,7 @@
 #define CQ_RING_SIZE            2048
 
 #define RX_BURST_SIZE           64
-#define CLASSIFY_BATCH_SIZE     1024
+#define CLASSIFY_BATCH_SIZE     100000
 
 #define DDOS_PPS_THRESHOLD      2000
 
@@ -401,15 +401,23 @@ static void rx_loop(struct xsk_state *xsks)
     time_t start_ts = time(NULL);
     time_t last_print = start_ts;
 
-    struct gpu_batch_host batch;
-    struct gpu_result_host result;
-    uint64_t recycle_addrs[CLASSIFY_BATCH_SIZE];
+    struct gpu_batch_host *batch = calloc(1, sizeof(*batch));
+    struct gpu_result_host *result = calloc(1, sizeof(*result));
+    uint64_t *recycle_addrs = calloc(CLASSIFY_BATCH_SIZE, sizeof(uint64_t));
+
+    if (!batch || !result || !recycle_addrs) {
+        fprintf(stderr, "failed to allocate batch buffers\n");
+        free(batch);
+        free(result);
+        free(recycle_addrs);
+        return;
+    }
 
     uint64_t batch_start_ns = 0;
     int batch_timer_active = 0;
 
-    reset_gpu_batch(&batch);
-    memset(&result, 0, sizeof(result));
+    reset_gpu_batch(batch);
+    memset(result, 0, sizeof(*result));
 
     while (running) {
         int pret = poll(fds, 1, 1000);
@@ -431,7 +439,7 @@ static void rx_loop(struct xsk_state *xsks)
                 uint8_t *pkt = xsk_umem_get_data(xsks->umem_area, desc->addr);
                 uint32_t len = desc->len;
 
-                if (batch.count == 0 && !batch_timer_active) {
+                if (batch->count == 0 && !batch_timer_active) {
                     batch_start_ns = get_time_ns();
                     batch_timer_active = 1;
                 }
@@ -445,12 +453,15 @@ static void rx_loop(struct xsk_state *xsks)
                     continue;
                 }
 
-                if (batch.count >= CLASSIFY_BATCH_SIZE ||
-                    batch.total_bytes + len > MAX_BATCH_BYTES) {
-                    unsigned int flushed_pkts = batch.count;
+                if (batch->count >= CLASSIFY_BATCH_SIZE ||
+                    batch->total_bytes + len > MAX_BATCH_BYTES) {
+                    unsigned int flushed_pkts = batch->count;
 
-                    if (flush_gpu_batch(xsks, &batch, &result, recycle_addrs) < 0) {
+                    if (flush_gpu_batch(xsks, batch, result, recycle_addrs) < 0) {
                         xsk_ring_cons__release(&xsks->rx, rcvd);
+                        free(batch);
+                        free(result);
+                        free(recycle_addrs);
                         return;
                     }
 
@@ -467,18 +478,21 @@ static void rx_loop(struct xsk_state *xsks)
                     }
                 }
 
-                batch.offsets[batch.count] = batch.total_bytes;
-                batch.lengths[batch.count] = len;
-                memcpy(&batch.packet_buffer[batch.total_bytes], pkt, len);
-                recycle_addrs[batch.count] = desc->addr;
-                batch.total_bytes += len;
-                batch.count++;
+                batch->offsets[batch->count] = batch->total_bytes;
+                batch->lengths[batch->count] = len;
+                memcpy(&batch->packet_buffer[batch->total_bytes], pkt, len);
+                recycle_addrs[batch->count] = desc->addr;
+                batch->total_bytes += len;
+                batch->count++;
 
-                if (batch.count == CLASSIFY_BATCH_SIZE) {
-                    unsigned int flushed_pkts = batch.count;
+                if (batch->count == CLASSIFY_BATCH_SIZE) {
+                    unsigned int flushed_pkts = batch->count;
 
-                    if (flush_gpu_batch(xsks, &batch, &result, recycle_addrs) < 0) {
+                    if (flush_gpu_batch(xsks, batch, result, recycle_addrs) < 0) {
                         xsk_ring_cons__release(&xsks->rx, rcvd);
+                        free(batch);
+                        free(result);
+                        free(recycle_addrs);
                         return;
                     }
 
@@ -497,10 +511,10 @@ static void rx_loop(struct xsk_state *xsks)
         {
             time_t now = time(NULL);
 
-            if (batch.count > 0 && (now - last_print >= 1)) {
-                unsigned int flushed_pkts = batch.count;
+            if (batch->count > 0 && (now - last_print >= 1)) {
+                unsigned int flushed_pkts = batch->count;
 
-                if (flush_gpu_batch(xsks, &batch, &result, recycle_addrs) < 0)
+                if (flush_gpu_batch(xsks, batch, result, recycle_addrs) < 0)
                     break;
 
                 {
@@ -518,10 +532,10 @@ static void rx_loop(struct xsk_state *xsks)
         }
     }
 
-    if (running && batch.count > 0) {
-        unsigned int flushed_pkts = batch.count;
+    if (running && batch->count > 0) {
+        unsigned int flushed_pkts = batch->count;
 
-        (void)flush_gpu_batch(xsks, &batch, &result, recycle_addrs);
+        (void)flush_gpu_batch(xsks, batch, result, recycle_addrs);
 
         {
             uint64_t batch_end_ns = get_time_ns();
@@ -532,6 +546,10 @@ static void rx_loop(struct xsk_state *xsks)
     }
 
     print_periodic_stats(start_ts);
+
+    free(batch);
+    free(result);
+    free(recycle_addrs);
 }
 
 static void cleanup(struct xsk_state *xsks, struct bpf_object *obj, const char *ifname)
@@ -596,7 +614,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (gpu_reset_state() != 0) {
+    if (gpu_reset_state() != 0) 
+    {
         fprintf(stderr, "failed to reset GPU backend\n");
         cleanup(&xsks, obj, ifname);
         return 1;
