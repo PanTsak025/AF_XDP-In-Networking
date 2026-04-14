@@ -34,7 +34,7 @@
 #define CQ_RING_SIZE            2048
 
 #define RX_BURST_SIZE           64
-#define CLASSIFY_BATCH_SIZE     100000
+#define CLASSIFY_BATCH_SIZE     1024 // this is batch size
 
 #define DDOS_PPS_THRESHOLD      2000
 
@@ -178,7 +178,8 @@ static int recycle_batch_addrs(struct xsk_state *xsks, uint64_t *addrs, uint32_t
 
     return 0;
 }
-
+uint64_t total_gpu_batch_time_ns = 0;
+uint64_t total_gpu_batches = 0;
 static int flush_gpu_batch(struct xsk_state *xsks,
                            struct gpu_batch_host *batch,
                            struct gpu_result_host *result,
@@ -188,6 +189,8 @@ static int flush_gpu_batch(struct xsk_state *xsks,
         return 0;
 
     fill_batch_epoch_secs(batch);
+
+    uint64_t gpu_batch_start_ns = get_time_ns();
 
     if (gpu_classify_batch(batch->packet_buffer,
                            batch->offsets,
@@ -200,6 +203,10 @@ static int flush_gpu_batch(struct xsk_state *xsks,
         g_stats.gpu_submit_fail++;
         return -1;
     }
+
+    uint64_t gpu_batch_end_ns = get_time_ns();
+    total_gpu_batch_time_ns += (gpu_batch_end_ns - gpu_batch_start_ns);
+    total_gpu_batches++;
 
     update_stats_from_gpu_results(batch, result);
 
@@ -380,15 +387,27 @@ static void print_periodic_stats(time_t start_ts)
     printf("classify_batch        : %d\n", CLASSIFY_BATCH_SIZE);
     printf("threshold_pps         : %d\n", DDOS_PPS_THRESHOLD);
 
-    if (total_classified_pkts > 0) {
-        double avg_proc_latency_ns =
-            (double)total_classification_time_ns / (double)total_classified_pkts;
-        double avg_proc_latency_us = avg_proc_latency_ns / 1000.0;
-        double avg_proc_latency_ms = avg_proc_latency_ns / 1000000.0;
+    // if (total_classified_pkts > 0) 
+    // {
+    //     double avg_proc_latency_ns =
+    //         (double)total_classification_time_ns / (double)total_classified_pkts;
+    //     double avg_proc_latency_us = avg_proc_latency_ns / 1000.0;
+    //     double avg_proc_latency_ms = avg_proc_latency_ns / 1000000.0;
 
-        printf("avg_proc_latency_ns   : %.2f\n", avg_proc_latency_ns);
-        printf("avg_proc_latency_us   : %.3f\n", avg_proc_latency_us);
-        printf("avg_proc_latency_ms   : %.6f\n", avg_proc_latency_ms);
+    //     printf("avg_proc_latency_ns   : %.2f\n", avg_proc_latency_ns);
+    //     printf("avg_proc_latency_us   : %.3f\n", avg_proc_latency_us);
+    //     printf("avg_proc_latency_ms   : %.6f\n", avg_proc_latency_ms);
+    // }
+    if (total_gpu_batches > 0) 
+    {
+        double avg_gpu_batch_time_ns =
+            (double)total_gpu_batch_time_ns / (double)total_gpu_batches;
+        double avg_gpu_batch_time_us = avg_gpu_batch_time_ns / 1000.0;
+        double avg_gpu_batch_time_ms = avg_gpu_batch_time_ns / 1000000.0;
+
+        printf("avg_gpu_batch_time_ns : %.2f\n", avg_gpu_batch_time_ns);
+        printf("avg_gpu_batch_time_us : %.3f\n", avg_gpu_batch_time_us);
+        printf("avg_gpu_batch_time_ms : %.6f\n", avg_gpu_batch_time_ms);
     }
 }
 
